@@ -1,7 +1,11 @@
-FROM node:26
-LABEL maintainer="requarks.io"
+FROM harbor.gdalpha.com/alpha-tools/nodejs:26.12.1
+LABEL maintainer="huanglshu26@gmail.com"
 
-RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -qy --no-install-recommends \
+# 使用阿里云镜像源。
+ENV NPM_CONFIG_REGISTRY=https://registry.npmmirror.com
+RUN find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
+        -exec sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' {} + && \
+    DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -qy --no-install-recommends \
     bash \
     build-essential \
     curl \
@@ -30,41 +34,38 @@ USER node
 
 ENV NODE_ENV=production
 
-# The browser the Puppeteer extension drives is the one Puppeteer installs for itself, not the distro's:
-# Puppeteer speaks the protocol of the single Chrome release it was built against, and a distro package
-# moves on with every security update while Puppeteer stays pinned, so each rebuild widened the gap until
-# every render failed. Installed by Puppeteer, the pin below decides both halves of the pair.
+# Puppeteer 扩展使用的浏览器由 Puppeteer 自行安装，而不是使用发行版提供的浏览器：
+# Puppeteer 只兼容其构建时对应的 Chrome 版本，而发行版软件包会随安全更新不断升级，
+# 导致两者版本差距逐渐扩大，最终使页面渲染失败。此处由 Puppeteer 安装并固定浏览器版本。
 #
-# Only the headless shell, which is all a renderer needs; the full browser is skipped.
-# The cache is a fixed path rather than under $HOME so that it is found whatever user the container is
-# run as -- an arbitrary UID on OpenShift has no home directory of its own.
+# 渲染只需要无头浏览器，因此跳过完整浏览器安装。
+# 缓存使用固定路径而不是 $HOME，以确保无论容器以哪个用户运行都能找到缓存；
+# 在 OpenShift 上运行的任意 UID 可能没有自己的主目录。
 ENV PUPPETEER_CACHE_DIR=/wiki/.cache/puppeteer
 ENV PUPPETEER_CHROME_SKIP_DOWNLOAD=true
 
 WORKDIR /wiki/backend
 RUN npm ci --omit=dev
 
-# The Puppeteer extension, which server-side page rendering needs. Added here rather than declared in
-# `backend/package.json` because it is an optional extension: an installation that renders its pages in
-# the editor -- which is all of them, on any normal save -- has no use for a browser on the server, and
-# a source checkout should not have to fetch one to install the backend.
+# Puppeteer 扩展用于服务端页面渲染。它没有声明在 `backend/package.json` 中，因为这是一个可选扩展：
+# 只需要在编辑器中渲染页面的安装（正常保存时都会如此）不需要服务端浏览器，
+# 源码检出时也不应为了安装后端而下载浏览器。
 #
-# The version is read from the extension definition, which is also what the admin area installs when an
-# operator adds Puppeteer to an instance by hand: one place to bump, and an image that cannot drift from
-# what a hand-installed instance gets. An empty read fails the build rather than quietly installing
-# whatever is newest.
+# 版本从扩展定义中读取，管理员手动安装 Puppeteer 时也使用同一版本：
+# 只需在一个位置升级版本，镜像就不会与手动安装的实例产生偏差。
+# 如果读取结果为空，构建会直接失败，而不是悄悄安装最新版本。
 #
-# Puppeteer's postinstall downloads the browser, and `browsers install` makes sure of it: npm may be
-# configured not to run install scripts, and when the browser is already there it only prints its path.
+# Puppeteer 的 postinstall 会下载浏览器，`browsers install` 用于确保浏览器确实存在：
+# npm 可能被配置为不执行安装脚本；如果浏览器已经存在，该命令只会输出其路径。
 RUN PUPPETEER_VERSION="$(sed -n 's/^installVersion: *//p' modules/extensions/puppeteer/definition.yml)" && \
     test -n "$PUPPETEER_VERSION" && \
     npm install --no-save "puppeteer@${PUPPETEER_VERSION}" && \
     npx puppeteer browsers install chrome-headless-shell
 
-# The system libraries that browser needs, which are no longer arriving as the dependencies of a distro
-# package. Each Chrome for Testing build lists its own in `deb.deps`, per architecture, and this is the
-# `apt-get satisfy` that `browsers install --install-deps` would run -- done here as root, rather than
-# running Puppeteer as root, so that nothing in the cache ends up owned by root.
+# 安装该浏览器需要的系统库，这些库不再作为发行版软件包的依赖自动安装。
+# 每个 Chrome for Testing 构建都会在 `deb.deps` 中按架构列出所需依赖，
+# 这里以 root 身份执行 `apt-get satisfy`，等同于 `browsers install --install-deps` 的操作，
+# 避免以 root 运行 Puppeteer 导致缓存文件归属 root。
 USER root
 RUN DEPS="$(find "$PUPPETEER_CACHE_DIR" -name deb.deps)" && \
     test "$(printf '%s\n' "$DEPS" | grep -c .)" -eq 1 && \
@@ -73,15 +74,14 @@ RUN DEPS="$(find "$PUPPETEER_CACHE_DIR" -name deb.deps)" && \
     rm -rf /var/lib/apt/lists/*
 USER node
 
-# Launch the browser the way the renderer does and navigate once, which is the step a mismatched or
-# half-installed browser fails at. A pair that cannot render fails the image build, not every render
-# on every instance running the image.
+# 按渲染器的方式启动浏览器并访问一次页面，以便发现版本不匹配或安装不完整的问题。
+# 无法渲染的浏览器会在镜像构建阶段直接报错，而不是等到每个实例运行时才失败。
 #
-# Only on a native build. A multi-platform build runs the other architecture under QEMU user-mode
-# emulation, where Chrome starts, accepts the DevTools connection and then dies on the first protocol
-# call ("Target closed") however sound the install is -- so there the check is that the binary is an
-# ELF for the architecture being built, which is the mistake an older pin makes silently (the x64 build
-# installed on arm64). e_machine, at offset 18, is 0x3e for x86-64 and 0xb7 for aarch64.
+# 仅在原生构建时执行完整启动检查。多平台构建会在 QEMU 用户态模拟下运行其他架构，
+# Chrome 可能启动并接受 DevTools 连接，但在第一次协议调用时以 “Target closed” 退出，
+# 即使安装本身没有问题。因此这种构建只检查二进制文件是否属于目标架构，
+# 以发现旧版本固定错误导致的架构不匹配。ELF 头部偏移 18 处的 e_machine：
+# x86-64 为 0x3e，aarch64 为 0xb7。
 ARG BUILDARCH
 ARG TARGETARCH
 RUN if [ -z "$TARGETARCH" ] || [ "$TARGETARCH" = "$BUILDARCH" ]; then \
@@ -114,23 +114,21 @@ VOLUME ["/wiki/data/repo"]
 EXPOSE 3000
 EXPOSE 3443
 
-# An init in front of node, because whatever is PID 1 inherits every orphaned process in the container
-# and has to reap it, and node never does. git orphans one on every commit, pull and rebase: each runs
-# `git maintenance run --auto --detach` on the way out, which forks into the background whether or not
-# there is anything to maintain, and its parent exits -- so a git storage target left a zombie behind
-# per page save, thousands of them on a busy wiki. The browser Puppeteer drives forks helpers of its
-# own the same way.
+# 在 node 前使用 init 进程，因为 PID 1 会继承容器内所有孤儿进程并负责回收，而 node 不会。
+# git 在每次 commit、pull 和 rebase 时都会产生孤儿进程：它退出时执行
+# `git maintenance run --auto --detach`，无论是否有内容需要维护都会转入后台，随后父进程退出。
+# 因此使用 git 存储时，每次保存页面都会留下一个僵尸进程，繁忙的 wiki 中可能积累数千个。
+# Puppeteer 驱动的浏览器也会以相同方式产生自己的辅助进程。
 #
-# `-s` registers tini as a subreaper, so it still collects them when it is not PID 1 itself (`docker
-# run --init`, or a pod sharing its process namespace). Signals are forwarded to node unchanged, so the
-# graceful shutdown in `index.ts` sees the same SIGTERM it did before.
+# `-s` 让 tini 注册为 subreaper，因此即使它不是 PID 1 本身（例如 `docker run --init`，
+# 或共享进程命名空间的 Pod），也能回收这些进程。信号会原样转发给 node，
+# 因此 `index.ts` 中的优雅关闭逻辑仍能收到与之前相同的 SIGTERM。
 ENTRYPOINT ["tini", "-s", "--"]
 
-# Web Storage off, which is what it was before Node 26 turned it on by default.
+# 关闭 Web Storage，恢复 Node 26 默认开启该功能之前的行为。
 #
-# Nothing here uses `localStorage`, but `lib0` -- under yjs, which is what makes an editing session
-# collaborative -- probes for it as it loads, the way a library that runs in both a browser and node
-# has to. Without `--localstorage-file` that probe is answered with an experimental warning rather
-# than a value, so the first line of every container's log was a warning about a feature the server
-# does not use. Off, the global is absent and the probe takes its node path in silence.
+# 这里没有使用 `localStorage`，但 yjs 依赖的 `lib0` 在加载时会探测它，
+# 因为该库需要同时运行在浏览器和 Node.js 中。如果没有指定 `--localstorage-file`，
+# 探测会产生实验性功能警告，导致每个容器日志的第一行都是该警告。
+# 关闭后全局对象不存在，`lib0` 会静默地走 Node.js 分支。
 CMD ["node", "--no-experimental-webstorage", "backend"]
